@@ -16,11 +16,16 @@ const DeepCopy = <T extends object>(Object: T): T => {
 
 export class Crate<T extends defined> {
 	private State: T;
-	private CrateOpen = true;
 	private UpdateBind: BindableEvent;
 	private Connections: RBXScriptConnection[] = [];
 	private InitialState: T;
 	private MiddlewareMap = new Map<unknown, unknown>();
+	private LockedKeys = new Set<keyof T>();
+	private IsVerbose = false;
+
+	private Log(Msg: string, Verbose = true) {
+		if (!Verbose || this.IsVerbose) warn(`${this.IsVerbose ? "[VRB] " : ""}[Crate] ${Msg}`);
+	}
 
 	/**
 	 * Create a new crate with an initial state.
@@ -34,7 +39,7 @@ export class Crate<T extends defined> {
 		this.State = InitialState;
 		this.InitialState = DeepCopy(InitialState);
 		this.UpdateBind = new Instance("BindableEvent", script);
-		this.CrateOpen = !Closed;
+		Closed && this.Lock();
 	}
 
 	// Internal method to execute middleware.
@@ -45,9 +50,14 @@ export class Crate<T extends defined> {
 		const Result = Method !== undefined ? Method(New, Old) : New;
 
 		if (tick() - MW_EXEC_TIME > 0.2)
-			warn("[Crate] ERROR: Yeilding is prohibited within middleware to prevent unexpected behavior.");
+			this.Log("WARN: Yeilding is prohibited within middleware to prevent unexpected behavior.", false);
 
 		return Result;
+	}
+
+	Verbose() {
+		this.IsVerbose = true;
+		return this;
 	}
 
 	/**
@@ -79,12 +89,12 @@ export class Crate<T extends defined> {
 	 * ```
 	 * const MyCrate = new Crate({MyNum: 10})
 	 *
-	 * MyCrate.OnUpdate("MyNum", (New, Old) => {
+	 * MyCrate.OnChange("MyNum", (New, Old) => {
 	 *  print(New, Old) // 5 & 10
 	 * })
 	 * ```
 	 */
-	OnUpdate<U extends keyof T>(Key: U, Callback: (NewData: T[U], OldData: T[U]) => void): RBXScriptConnection;
+	OnChange<U extends keyof T>(Key: U, Callback: (NewData: T[U], OldData: T[U]) => void): RBXScriptConnection;
 	/**
 	 * Listen for changes on the entire crate.
 	 *
@@ -94,13 +104,14 @@ export class Crate<T extends defined> {
 	 * ```
 	 * const MyCrate = new Crate({MyNum: 10})
 	 *
-	 * MyCrate.OnUpdate((NewStore, OldStore) => {
+	 * MyCrate.OnChange((NewStore, OldStore) => {
 	 *  print(New.MyNum, Old.MyNum) // 5 & 10
 	 * })
 	 * ```
 	 */
-	OnUpdate<U extends keyof T>(Callback: (NewData: T, OldData: T) => void): RBXScriptConnection;
-	OnUpdate<U extends keyof T>(Key: U, Callback = Key as unknown): RBXScriptConnection {
+	//FIXME: Make onchange with no key return the key changed, new data, and old data.
+	OnChange<U extends keyof T>(Callback: (NewData: T, OldData: T) => void): RBXScriptConnection;
+	OnChange<U extends keyof T>(Key: U, Callback = Key as unknown): RBXScriptConnection {
 		const Call = Callback as (NewData: T[U] | T, OldData: T[U] | T) => void;
 
 		const Event = this.UpdateBind.Event.Connect((K: U, O: T[U], N: T[U]) =>
@@ -124,10 +135,11 @@ export class Crate<T extends defined> {
 	 * Usage:
 	 * ```
 	 * const MyCrate = new Crate( { MyNum: 10 } )
-	 * MyCrate.Update("MyNum", 5)
+	 * const Old = MyCrate.Update("MyNum", 5)
+	 * print(Old) // 10
 	 * ```
 	 */
-	Update<U extends keyof T>(Key: U, Value?: T[U]): T[U];
+	Update<U extends keyof T>(Key: U, Value: T[U]): T[U];
 	/**
 	 * Update multiple values within the crate.
 	 *
@@ -139,18 +151,22 @@ export class Crate<T extends defined> {
 	 * })
 	 * ```
 	 */
-	Update<U extends keyof T>(Dispatch: Record<U, T[U]>): void;
+	Update(Dispatch: Partial<T>): void;
 	Update<U extends keyof T>(Key: unknown, Value?: unknown) {
 		if (typeIs(Key, "table")) {
 			for (const [K, V] of pairs(Key)) {
 				this.Update(K as U, V as T[U]);
 			}
 		} else {
+			if (this.LockedKeys.has(Key as U)) {
+				this.Log(`Attepted to set (${tostring(Key)} => ${tostring(Value)}), but the key is locked.`);
+				return;
+			}
+
 			const Old = this.State[Key as U];
-
-			if (!this.CrateOpen) return Value;
-
 			const Result = this.ExecuteMiddleware(Key as U, Value as T[U], Old);
+
+			if (Result === Old) return Old;
 
 			this.State[Key as U] = Result;
 			this.UpdateBind.Fire(Key as U, Old, Result);
@@ -165,8 +181,10 @@ export class Crate<T extends defined> {
 	 * If the Key[Val]'s type is NaN, this method will throw a warning. It will not mutate the state.
 	 */
 	Increment<U extends keyof T>(Key: U, Amount: number): T[U] {
+		if (this.LockedKeys.has(Key as U)) return this.State[Key];
+
 		if (!typeIs(this.State[Key], "number")) {
-			warn("[Crate] Attempt to increment a non-integer.");
+			this.Log(`WARN: Attempt to increment '${tostring(Key)}', a non-integer value.`, true);
 			return this.State[Key];
 		}
 
@@ -174,7 +192,6 @@ export class Crate<T extends defined> {
 		const New = (Old as number) + Amount;
 
 		const Result = this.ExecuteMiddleware(Key as U, New as T[U], Old);
-
 		this.State[Key] = Result;
 		this.UpdateBind.Fire(Key as U, Old, Result);
 
@@ -212,46 +229,107 @@ export class Crate<T extends defined> {
 	}
 
 	/**
-	 * Open the crate and permit writes.
+	 * Unlock all keys within the crate and permit writes.
 	 */
-	Open() {
-		this.CrateOpen = true;
+	Unlock(): void;
+	/**
+	 * Unlock a single key to permit writes.
+	 */
+	Unlock<U extends keyof T>(Key: U): void;
+	Unlock<U extends keyof T>(Key?: U) {
+		if (Key !== undefined) {
+			this.LockedKeys.delete(Key);
+		} else {
+			for (const [Key, _] of pairs(this.State as object)) {
+				this.LockedKeys.delete(Key as U);
+			}
+		}
 	}
 
 	/**
-	 * Close the crate and prevent writes.
-	 *
-	 * ```
-	 * const MyCrate = new Crate({Name: "Paul"})
-	 *
-	 * MyCrate.Close()
-	 *
-	 * MyCrate.Update("Name", "John") // Silently ignored
-	 * ```
+	 * Lock all keys within the crate and prevent writes.
 	 */
-	Close() {
-		this.CrateOpen = false;
+	Lock(): void;
+	/**
+	 * Lock a single key to prevent writes.
+	 */
+	Lock<U extends keyof T>(Key: U): void;
+	Lock<U extends keyof T>(Key?: U) {
+		if (Key !== undefined) {
+			this.LockedKeys.add(Key);
+		} else {
+			for (const [Key, _] of pairs(this.State as object)) {
+				this.LockedKeys.add(Key as U);
+			}
+		}
 	}
 
 	/**
-	 * Return's true if the crate is open, and false if it's closed.
+	 * Return's true if the crate is locked, and false if it's not.
 	 */
-	IsOpen() {
-		return this.CrateOpen;
+	/**
+	 * Iterates through the store to check if any keys are unlocked.
+	 *
+	 * If there is an unlocked key, the crate is not fully locked.
+	 */
+	IsLocked(): void;
+	/**
+	 * Check if a specific key is locked.
+	 */
+	IsLocked<U extends keyof T>(Key: U): void;
+	IsLocked<U extends keyof T>(Key?: U) {
+		if (Key !== undefined) {
+			return this.LockedKeys.has(Key as U);
+		} else {
+			for (const [Key, _] of pairs(this.State as object)) {
+				if (!this.LockedKeys.has(Key as U)) return false;
+			}
+
+			return true;
+		}
 	}
 
 	/**
 	 * Reset a key to it's default state.
 	 */
-	Reset<U extends keyof T>(Key: U): void {
+	Reset<U extends keyof T>(Key: U): this {
 		this.Update(Key, this.InitialState[Key]);
+
+		return this;
 	}
 
 	/**
 	 * Return the crate to it's default state.
 	 */
-	Restore() {
+	Restore(): this {
 		this.State = DeepCopy(this.InitialState);
+		return this;
+	}
+
+	/**
+	 * Snapshot the current state as the new default.
+	 *
+	 * If `Restore()` or `Reset()` are called, it will revert to this value.
+	 */
+	Snapshot(): this {
+		this.InitialState = DeepCopy(this.State);
+
+		return this;
+	}
+
+	/**
+	 * Overwrite the internal memory to a new state. Must retain the type of the original data.
+	 *
+	 * Keeps the original state in tact. To overwrite this state, use `Snapshot()`:
+	 * ```ts
+	 * HealthCrate.Overwrite({
+	 * 	Health: 10
+	 * }).Snapshot()
+	 * ```
+	 */
+	Overwrite(State: T): this {
+		this.State = State;
+		return this;
 	}
 
 	/**
